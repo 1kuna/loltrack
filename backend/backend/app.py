@@ -25,6 +25,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+    app.include_router(auth.config_router, prefix="/api", tags=["config"])
     app.include_router(sync.router, prefix="/api/sync", tags=["sync"])
     app.include_router(metrics.router, prefix="/api", tags=["metrics"])
     app.include_router(matches.router, prefix="/api", tags=["matches"])

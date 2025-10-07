@@ -9,6 +9,7 @@ from loltrack.riot import RiotClient
 
 
 router = APIRouter()
+config_router = APIRouter()
 
 
 @router.post("/riot-key")
@@ -36,12 +37,12 @@ def set_riot_id(payload: Dict[str, str]):
     return {"ok": True, "data": {"puuid": acct.get("puuid"), "region": cfg["riot"]["region"], "platform": cfg["riot"]["platform"]}}
 
 
-@router.get("/config")
+@config_router.get("/config")
 def get_cfg():
     return {"ok": True, "data": get_config()}
 
 
-@router.put("/config")
+@config_router.put("/config")
 def put_cfg(payload: Dict[str, Any]):
     cfg = get_config()
     # shallow merge
