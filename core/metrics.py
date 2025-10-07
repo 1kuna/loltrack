@@ -275,6 +275,11 @@ def ingest_and_compute_recent(
         row = compute_metrics(match, timeline, puuid)
         row["match_id"] = mid
         store.upsert_metrics(mid, row)
+        # Compute extras (without Data Dragon; mythic/two-item may be 0)
+        # Lazy import to avoid circular dependency
+        from .metrics_extras import compute_extras
+        extras = compute_extras(match, timeline, None, puuid)
+        ex_row = {"match_id": mid, **extras["extras_row"]}
+        store.upsert_metrics_extras(mid, ex_row)
         ingested += 1
     return ingested
-

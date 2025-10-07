@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import ScoreCard from '../components/ScoreCard'
+import GISSummary from '../components/GISSummary'
 import { statusFor } from '../lib/format'
 import FilterBar, { useSegmentParams, toQuery } from '../shared/FilterBar'
 
@@ -29,6 +30,7 @@ export default function Dashboard() {
         <h1 className="text-2xl font-bold">Dashboard</h1>
         <FilterBar />
       </div>
+      <GISSummary />
       {err && <div className="card text-red-400">{String(err?.message||err)}</div>}
       {!roll && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">

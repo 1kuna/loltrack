@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
 
-from ..ingest.ddragon import ensure_ddragon, champ_id_to_name, spell_id_to_name, ensure_icon
+from ..ingest.ddragon import ensure_ddragon, champ_id_to_name, spell_id_to_name, ensure_icon, ensure_rune_style_icon
 
 
 router = APIRouter()
@@ -29,4 +29,11 @@ def summoner_icon(spell_id: int):
     ver = ensure_ddragon()
     name = spell_id_to_name(ver, spell_id) or "SummonerFlash"
     p = ensure_icon("summoner", ver, name)
+    return FileResponse(str(p))
+
+
+@router.get("/assets/rune-style/{style_id}.png")
+def rune_style_icon(style_id: int):
+    ver = ensure_ddragon()
+    p = ensure_rune_style_icon(ver, style_id)
     return FileResponse(str(p))

@@ -37,6 +37,7 @@ def _ver_dir(ver: str) -> Path:
     (d / "img" / "champion").mkdir(parents=True, exist_ok=True)
     (d / "img" / "item").mkdir(parents=True, exist_ok=True)
     (d / "img" / "spell").mkdir(parents=True, exist_ok=True)
+    (d / "img" / "rune_style").mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -74,6 +75,77 @@ def champ_id_to_name(ver: str, champ_id: int) -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+def load_items_json(ver: str) -> Dict[str, Any]:
+    d = _ver_dir(ver)
+    p = d / "item.json"
+    if not p.exists():
+        ensure_ddragon()
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {"data": {}}
+
+
+def load_runes_json(ver: str) -> Dict[str, Any]:
+    d = _ver_dir(ver)
+    p = d / "runesReforged.json"
+    if not p.exists():
+        ensure_ddragon()
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def style_name_by_id(ver: str, style_id: int) -> Optional[str]:
+    data = load_runes_json(ver)
+    for style in data or []:
+        try:
+            if int(style.get("id")) == int(style_id):
+                return style.get("name")
+        except Exception:
+            continue
+    return None
+
+
+def ensure_rune_style_icon(ver: str, style_id: int) -> Path:
+    d = _ver_dir(ver)
+    out = d / "img" / "rune_style" / f"{style_id}.png"
+    if out.exists():
+        return out
+    data = load_runes_json(ver)
+    icon_rel = None
+    for style in data or []:
+        try:
+            if int(style.get("id")) == int(style_id):
+                icon_rel = style.get("icon")
+                break
+        except Exception:
+            continue
+    if not icon_rel:
+        # write placeholder 1x1
+        import base64
+        png_1x1 = base64.b64decode(
+            b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        out.write_bytes(png_1x1)
+        return out
+    url = f"https://ddragon.leagueoflegends.com/cdn/img/{icon_rel}"
+    with _http() as h:
+        try:
+            r = h.get(url)
+            r.raise_for_status()
+            out.write_bytes(r.content)
+        except Exception:
+            # placeholder
+            import base64
+            png_1x1 = base64.b64decode(
+                b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+            )
+            out.write_bytes(png_1x1)
+    return out
 
 
 def spell_id_to_name(ver: str, spell_id: int) -> Optional[str]:
@@ -125,4 +197,3 @@ def ensure_icon(kind: str, ver: str, name_or_id: str) -> Path:
             )
             p.write_bytes(png_1x1)
     return p
-

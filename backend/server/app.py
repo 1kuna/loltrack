@@ -10,7 +10,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 
 from .routers import auth, sync, metrics, matches, health
+from .routers import gis as gis_router
+from .routers import live as live_router
 from .routers import assets
+from .cron.sweeper import start_sweeper
+from .cron.ingestor import start_ingestor
 
 
 def create_app() -> FastAPI:
@@ -29,13 +33,26 @@ def create_app() -> FastAPI:
     app.include_router(sync.router, prefix="/api/sync", tags=["sync"])
     app.include_router(metrics.router, prefix="/api", tags=["metrics"])
     app.include_router(matches.router, prefix="/api", tags=["matches"])
+    app.include_router(gis_router.router, prefix="/api", tags=["gis"])
     app.include_router(health.router, prefix="/api", tags=["health"])
+    app.include_router(live_router.router, prefix="/api/live", tags=["live"])  # /api/live/status
     app.include_router(assets.router, tags=["assets"])  # /assets/*
 
     # WebSocket route for live under /ws defined in router module
     from .live.socket import register_ws
     
     register_ws(app)
+    # Background sweeper for precomputing advanced metrics (hourly, low-power)
+    try:
+        start_sweeper()
+    except Exception:
+        # Non-fatal if sweeper fails to start
+        pass
+    # Background ingestor for new matches (every 5 minutes)
+    try:
+        start_ingestor()
+    except Exception:
+        pass
 
     # Global error handler → uniform envelope
     @app.exception_handler(Exception)

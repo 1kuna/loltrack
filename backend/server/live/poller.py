@@ -20,7 +20,8 @@ def stream_live_payloads(live: LiveClient | None = None) -> Generator[Dict[str, 
 
         gd = data.get("gameData", {})
         t = gd.get("gameTime", 0.0)
-        scores = data.get("activePlayer", {}).get("scores", {})
+        ap = data.get("activePlayer", {})
+        scores = ap.get("scores", {})
         cs_now = int(scores.get("creepScore") or 0)
         deaths = int(scores.get("deaths") or 0)
         csmin = cs_now / max(t / 60.0, 1e-6)
@@ -35,6 +36,15 @@ def stream_live_payloads(live: LiveClient | None = None) -> Generator[Dict[str, 
         else:
             pace = "behind"
 
+        # gold estimate @10m
+        try:
+            current_gold = float(ap.get("currentGold") or 0.0)
+        except Exception:
+            current_gold = 0.0
+        remaining_min = max(0.0, (10 * 60 - (t or 0.0)) / 60.0)
+        GOLD_PER_CS = 21.0
+        gold10_est = int(current_gold + csmin * remaining_min * GOLD_PER_CS)
+
         payload = {
             "t": int(time.time()),
             "gameTime": t,
@@ -42,12 +52,12 @@ def stream_live_payloads(live: LiveClient | None = None) -> Generator[Dict[str, 
                 "dl14_on_track": bool(deaths == 0 and t < 14 * 60),
                 "cs": cs_now,
                 "cs10_eta": pace,
-                "gold10_est": None,
+                "gold10_est": gold10_est,
                 "gd10_est": None,
                 "xp10_est": None,
                 "xpd10_est": None,
                 "ctrlw_pre14_progress": {"have": None, "need": 1},
-                "recall_window": {"in_window": None, "range": "3:15–4:00"},
+                "recall_window": {"in_window": bool(195 <= (t or 0.0) <= 240), "range": "3:15–4:00"},
                 "tip": "Buy 1 control ward before 10:00",
             },
         }

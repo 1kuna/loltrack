@@ -63,6 +63,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "FirstRecall": 0.4,
         },
     },
+    "gis": {
+        "minMatchesForGIS": 5,
+        "minMatchesForFocus": 8,
+        "minPrimaryGap": -4.0,
+        "minPrimaryLead": 2.0,
+        "hysteresisMatches": 3,
+        "maxBandForFocus": 6.0,
+        "secondaryGap": -2.0,
+        "rankedQueues": [420, 440],
+        "maxNegativeImpactLowMastery": 3.0,
+    },
 }
 
 
@@ -161,4 +172,3 @@ def get_api_key() -> str | None:
 
 def set_api_key(value: str) -> None:
     keyring.set_password(KEYRING_SERVICE, "api_key", value)
-

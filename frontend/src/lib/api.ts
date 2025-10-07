@@ -38,6 +38,8 @@ export function mapErrorMessage(e: any): string {
   switch (code) {
     case 'MISSING_PREREQ':
       return 'Add your Riot API key and Riot ID in Settings first.'
+    case 'IN_GAME':
+      return 'You’re currently in a live match. Try again later.'
     case 'RIOT_429':
       return 'Riot API rate-limited. Try again later.'
     case 'INGEST_ERROR':
