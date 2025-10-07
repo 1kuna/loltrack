@@ -20,8 +20,8 @@ export default function MiniBullet({ value, target, unit }: { value: number|null
           <div className="h-full bg-slate-500" />
         </div>
       )}
-      <div className="absolute top-0 bottom-0" style={{left: `${pct*100}%`}}>
-        <div className="w-2 h-2 rounded-full bg-cyan-400 translate-x-[-50%] translate-y-[6px]" />
+      <div className="absolute top-1/2" style={{left: `${pct*100}%`, transform: 'translate(-50%, -50%)'}}>
+        <div className="w-2 h-2 rounded-full bg-cyan-400" />
       </div>
     </div>
   )

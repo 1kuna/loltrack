@@ -19,7 +19,7 @@ HUMAN_META = {
     "XPD10": {"name": "XP lead @10", "unit": "xp"},
     "CtrlWardsPre14": {"name": "Control wards before 14:00", "unit": "count"},
     "FirstRecall": {"name": "First recall time", "unit": "time"},
-    "KPEarly": {"name": "KPEarly", "unit": "rate"},
+    "KPEarly": {"name": "Kill participation before 14:00", "unit": "rate"},
 }
 
 @router.get("/metrics/rolling")
@@ -270,6 +270,12 @@ def get_targets():
         if target is None:
             target = 0
         meta = HUMAN_META.get(m, {"name": m, "unit": "count"})
+        # Normalize rates to fractions 0..1 for UI formatting where needed.
+        # DL14 is already 0..1 in storage; KPEarly is stored as 0..100.
+        if meta["unit"] == "rate" and m != "DL14":
+            p50 = (p50 / 100.0) if (p50 is not None) else None
+            p75 = (p75 / 100.0) if (p75 is not None) else None
+            target = (target / 100.0) if (target is not None) else None
         by_metric[m] = {"name": meta["name"], "unit": meta["unit"], "target": target, "p50": p50, "p75": p75}
     return {"ok": True, "data": {"provisional": not baseline_ok, "metrics": by_metric, "weights": weights}}
 

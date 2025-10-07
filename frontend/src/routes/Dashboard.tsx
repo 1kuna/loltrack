@@ -53,7 +53,8 @@ export default function Dashboard() {
               d30 = d30 != null ? d30/100.0 : null
             }
             const trend = roll?.series?.[m]?.values || null
-            const status = statusFor(meta.unit as any, w5, meta.target)
+            const displayTarget = (targets?.provisional && (!meta.target || meta.target === 0)) ? null : (meta.target ?? null)
+            const status = statusFor(meta.unit as any, w5, displayTarget ?? undefined)
             return (
               <ScoreCard
                 key={m as any}
@@ -61,7 +62,7 @@ export default function Dashboard() {
                 title={meta.name}
                 subtitle={'Avg last 5 | last 10 | last 30 days'}
                 windows={{ w5, w10, d30 }}
-                target={meta.target ?? null}
+                target={displayTarget}
                 unit={meta.unit as any}
                 trend={trend}
                 status={status}
