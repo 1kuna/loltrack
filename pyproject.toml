@@ -13,16 +13,13 @@ authors = [
   { name = "LoL-CLI", email = "noreply@example.com" }
 ]
 dependencies = [
-  "typer[all]>=0.12",
-  "rich>=13.7",
   "requests>=2.31",
   "PyYAML>=6.0",
   "python-dateutil>=2.9",
   "keyring>=24.3",
 ]
 
-[project.scripts]
-loltrack = "core.__main__:app"
+# No CLI entrypoint — web dashboard only
 
 [tool.hatch.build.targets.wheel]
 packages = ["core"]

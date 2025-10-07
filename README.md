@@ -17,11 +17,8 @@ On first run
 - Go to Settings → paste Riot API key (dev key) and Riot ID (GameName#TAG)
 - Click Dashboard → if empty, click Sync in Settings or run `POST /api/sync/pull?since=7d`
 
-CLI (legacy)
-- The repo still ships a CLI for power users:
-  - `pip install -e .`
-  - `loltrack auth --riot-id "Game#TAG"`
-  - `loltrack pull --since 7d && loltrack dash`
+CLI
+- The legacy CLI has been removed. Use the web app (Settings → add key/ID → Sync) or call the HTTP APIs directly.
 
 Config
 - Server-side YAML at OS-specific path:
