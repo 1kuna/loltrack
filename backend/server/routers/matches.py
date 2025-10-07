@@ -5,7 +5,7 @@ import sqlite3
 
 from fastapi import APIRouter, HTTPException, Query
 
-from loltrack.store import Store
+from core.store import Store
 from ..deps import config as get_cfg
 from ..ingest.ddragon import ensure_ddragon, champ_id_to_name
 

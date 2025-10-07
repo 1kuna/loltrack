@@ -47,7 +47,6 @@ def auth(
         set_api_key(api_key)
         rprint("[green]Saved API key to keyring.[/green]")
     else:
-        # ensure key present
         key = get_api_key()
         if not key:
             rprint("[yellow]No API key found. You can pass --api-key or set RIOT_API_KEY.[/yellow]")
@@ -72,7 +71,6 @@ def auth(
 
 @app.command()
 def live():
-    """Live dashboard (poll local client)."""
     cfg = get_config()
     live_client = LiveClient()
     with console.screen():
@@ -88,7 +86,6 @@ def pull(
     count: int = typer.Option(20, help="Max matches to scan on first page"),
     queue: Optional[int] = typer.Option(None, help="Queue filter, e.g. 420 for Ranked Solo"),
 ):
-    """Hydrate matches & timelines since X; compute metrics; update windows."""
     cfg = get_config()
     store = Store()
     rc = RiotClient.from_config(cfg)
@@ -98,14 +95,12 @@ def pull(
         raise typer.Exit(code=1)
     ingested = ingest_and_compute_recent(rc, store, puuid, since=since, count=count, queue_filter=queue or None)
     rprint(f"[green]Ingested[/green] {ingested} matches.")
-
     rebuild_windows(store, cfg)
     rprint("[green]Windows updated.[/green]")
 
 
 @app.command()
 def dash():
-    """Show rolling windows & trends dashboard."""
     cfg = get_config()
     store = Store()
     render_dashboard(store, cfg)
@@ -115,7 +110,6 @@ def dash():
 def config(
     action: str = typer.Argument("show", help="show|edit|path"),
 ):
-    """Show or edit YAML config."""
     if action == "show":
         rprint(Path(config_path()).read_text())
     elif action == "path":
@@ -131,7 +125,6 @@ def config(
 
 @app.command()
 def rebuild():
-    """Rebuild windows from raw tables."""
     cfg = get_config()
     store = Store()
     rebuild_windows(store, cfg)
@@ -140,37 +133,31 @@ def rebuild():
 
 @app.command()
 def doctor():
-    """Environment checks: config, API key, DB path, live client port, requests."""
     cfg = get_config()
     store = Store()
     ok = True
-
     rprint("[bold]Config[/bold]", config_path())
     if not Path(config_path()).exists():
         rprint("[red]Missing config file[/red]")
         ok = False
-
     key = get_api_key()
     if key:
         rprint("[green]API key present[/green]")
     else:
         rprint("[yellow]No API key found (set RIOT_API_KEY or run auth).[/yellow]")
-
     db_path = store.db_path
     rprint("[bold]DB[/bold]", db_path)
     if Path(db_path).exists():
         rprint("[green]DB present[/green]")
     else:
         rprint("[yellow]DB will be created on first run[/yellow]")
-
-    # Live client
+    # Live client reachability
     live_client = LiveClient()
     try:
         status = live_client.status()
         rprint(f"[green]Live client reachable[/green]: {status}")
     except Exception as e:
         rprint(f"[yellow]Live client not reachable[/yellow]: {e}")
-
     sys.exit(0 if ok else 1)
 
 

@@ -22,11 +22,11 @@ if (-not $env:PORT) { $env:PORT = "8787" }
 if ($Prod) {
   if (Test-Path frontend/package.json) { pushd frontend; npm run build; popd }
   Start-Process "http://127.0.0.1:$($env:PORT)/" | Out-Null
-  ./.venv/Scripts/uvicorn backend.app:app --host 127.0.0.1 --port $env:PORT
+  ./.venv/Scripts/uvicorn server.app:app --host 127.0.0.1 --port $env:PORT
 } else {
   if (Test-Path frontend/package.json) {
     $p = Start-Process powershell -ArgumentList "-NoLogo -NoProfile -Command cd frontend; npm run dev" -PassThru
     $p.Id | Out-File -FilePath ./.vite.pid
   }
-  ./.venv/Scripts/uvicorn backend.app:app --reload --host 127.0.0.1 --port $env:PORT
+  ./.venv/Scripts/uvicorn server.app:app --reload --host 127.0.0.1 --port $env:PORT
 }

@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Generator
 
-from loltrack.live import LiveClient
-from loltrack.config import get_config
+from core.live import LiveClient
+from core.config import get_config
 
 
 def stream_live_payloads(live: LiveClient | None = None) -> Generator[Dict[str, Any], None, None]:

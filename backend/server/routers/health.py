@@ -4,9 +4,9 @@ from fastapi import APIRouter
 import time
 import sqlite3
 
-from loltrack.live import LiveClient
-from loltrack.riot import RiotClient
-from loltrack.store import Store
+from core.live import LiveClient
+from core.riot import RiotClient
+from core.store import Store
 from ..deps import config as get_cfg
 from ..ingest.ddragon import ensure_ddragon, latest_version
 

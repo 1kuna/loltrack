@@ -32,3 +32,4 @@ async def ws_live_endpoint(websocket: WebSocket):
 
 def register_ws(app: FastAPI) -> None:
     app.websocket("/ws/live")(ws_live_endpoint)
+

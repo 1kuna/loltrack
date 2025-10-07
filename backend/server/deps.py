@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from loltrack.config import get_config, save_config, get_api_key, set_api_key
-from loltrack.store import Store
-from loltrack.riot import RiotClient
+from core.config import get_config, save_config, get_api_key, set_api_key
+from core.store import Store
+from core.riot import RiotClient
 
 
 def config() -> Dict[str, Any]:
@@ -28,4 +28,3 @@ __all__ = [
     "get_api_key",
     "set_api_key",
 ]
-

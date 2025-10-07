@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from ..deps import config as get_cfg
-from loltrack.store import Store
-from loltrack.metrics import ingest_and_compute_recent
-from loltrack.riot import RiotClient
-from loltrack.windows import rebuild_windows
+from core.store import Store
+from core.metrics import ingest_and_compute_recent
+from core.riot import RiotClient
+from core.windows import rebuild_windows
 
 
 router = APIRouter()

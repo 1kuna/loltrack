@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Query
 
 from ..deps import config as get_cfg
-from loltrack.store import Store
+from core.store import Store
 
 
 router = APIRouter()
@@ -40,7 +40,7 @@ def metrics_rolling(
     use_dynamic = any(v is not None and v != "" for v in [queue, role, champion, patch])
     out: Dict[str, Dict[str, Any]] = {}
     import sqlite3, time
-    from loltrack.windows import value_of as w_value_of, ewma as w_ewma, sparkline as w_sparkline, summarize as w_summarize
+    from core.windows import value_of as w_value_of, ewma as w_ewma, sparkline as w_sparkline, summarize as w_summarize
     counts = [int(x) for x in (windows.split(',') if windows else []) if x]
     days_list = [int(x) for x in (days.split(',') if days else []) if x]
 

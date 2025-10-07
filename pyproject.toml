@@ -22,13 +22,12 @@ dependencies = [
 ]
 
 [project.scripts]
-loltrack = "loltrack.__main__:app"
+loltrack = "core.__main__:app"
 
 [tool.hatch.build.targets.wheel]
-packages = ["loltrack"]
+packages = ["core"]
 
 [tool.ruff]
 line-length = 100
 select = ["E", "F", "I"]
 ignore = []
-

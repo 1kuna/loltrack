@@ -30,4 +30,3 @@ def summoner_icon(spell_id: int):
     name = spell_id_to_name(ver, spell_id) or "SummonerFlash"
     p = ensure_icon("summoner", ver, name)
     return FileResponse(str(p))
-

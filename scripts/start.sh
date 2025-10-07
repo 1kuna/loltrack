@@ -27,10 +27,10 @@ fi
 export PORT=${PORT:-8787}
 if [ "${PROD:-}" = "1" ]; then
   if [ -d frontend ]; then (cd frontend && npm run build); fi
-  uvicorn backend.app:app --host 127.0.0.1 --port "$PORT" &
+  uvicorn server.app:app --host 127.0.0.1 --port "$PORT" &
   sleep 1; (open "http://127.0.0.1:${PORT}/" 2>/dev/null || true)
   wait
 else
   if [ -d frontend ]; then (cd frontend && { npm run dev & echo $! > ../.vite.pid; }); fi
-  uvicorn backend.app:app --reload --host 127.0.0.1 --port "$PORT"
+  uvicorn server.app:app --reload --host 127.0.0.1 --port "$PORT"
 fi

@@ -5,7 +5,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, HTTPException
 
 from ..deps import get_config, save_config, set_api_key
-from loltrack.riot import RiotClient
+from core.riot import RiotClient
 
 
 router = APIRouter()
