@@ -11,40 +11,122 @@ from loltrack.store import Store
 router = APIRouter()
 
 
+HUMAN_META = {
+    "CS10": {"name": "CS by 10:00", "unit": "count"},
+    "CS14": {"name": "CS by 14:00", "unit": "count"},
+    "DL14": {"name": "No deaths until 14:00", "unit": "rate"},
+    "GD10": {"name": "Gold lead @10", "unit": "gold"},
+    "XPD10": {"name": "XP lead @10", "unit": "xp"},
+    "CtrlWardsPre14": {"name": "Control wards before 14:00", "unit": "count"},
+    "FirstRecall": {"name": "First recall time", "unit": "time"},
+    "KPEarly": {"name": "KPEarly", "unit": "rate"},
+}
+
 @router.get("/metrics/rolling")
 def metrics_rolling(
-    windows: str = Query("5,10,20"),
-    days: str = Query("30,60"),
+    windows: str = Query("5,10"),
+    days: str = Query("30"),
     segment: Optional[str] = Query(None),
+    queue: Optional[int] = Query(None),
+    role: Optional[str] = Query(None),
+    champion: Optional[int] = Query(None),
+    patch: Optional[str] = Query(None),
 ):
     cfg = get_cfg()
     puuid = cfg.get("player", {}).get("puuid")
     store = Store()
-    queue = (cfg.get("player", {}).get("track_queues") or [None])[0]
-    key = f"puuid:{puuid}:queue:{queue or 'any'}"
-    with store.connect() as con:
-        rows = con.execute(
-            "SELECT metric, window_type, window_value, value, n, trend, spark FROM windows WHERE key=?",
-            (key,),
-        ).fetchall()
+    cfg_queue = (cfg.get("player", {}).get("track_queues") or [None])[0]
+    # If any segment filter is specified, compute on-the-fly; otherwise use cached windows for the configured queue
+    use_dynamic = any(v is not None and v != "" for v in [queue, role, champion, patch])
     out: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        metric, wtype, wval, val, n, trend, spark = r
-        out.setdefault(metric, {}).setdefault(wtype, {})[int(wval)] = {
-            "value": val,
-            "n": int(n),
-            "trend": trend,
-            "spark": spark,
-        }
+    import sqlite3, time
+    from loltrack.windows import value_of as w_value_of, ewma as w_ewma, sparkline as w_sparkline, summarize as w_summarize
+    counts = [int(x) for x in (windows.split(',') if windows else []) if x]
+    days_list = [int(x) for x in (days.split(',') if days else []) if x]
+
+    if not use_dynamic:
+        key = f"puuid:{puuid}:queue:{cfg_queue or 'any'}"
+        with store.connect() as con:
+            rows = con.execute(
+                "SELECT metric, window_type, window_value, value, n, trend, spark FROM windows WHERE key=?",
+                (key,),
+            ).fetchall()
+        for r in rows:
+            metric, wtype, wval, val, n, trend, spark = r
+            out.setdefault(metric, {}).setdefault(wtype, {})[int(wval)] = {
+                "value": val,
+                "n": int(n),
+                "trend": trend,
+                "spark": spark,
+            }
+    else:
+        # Build filtered rows and compute windows
+        with store.connect() as con:
+            con.row_factory = sqlite3.Row
+            q = "SELECT * FROM metrics WHERE puuid=?"
+            params: list[Any] = [puuid]
+            if queue is not None and queue != -1:
+                q += " AND queue_id=?"
+                params.append(queue)
+            if role:
+                q += " AND role=?"
+                params.append(role)
+            if champion is not None:
+                q += " AND champion_id=?"
+                params.append(champion)
+            if patch:
+                q += " AND patch=?"
+                params.append(patch)
+            q += " ORDER BY game_creation_ms DESC"
+            rows_all = [dict(r) for r in con.execute(q, params).fetchall()]
+        metrics_list = cfg.get("metrics", {}).get("primary", [])
+        for m in metrics_list:
+            # count windows
+            for w in counts:
+                subset = rows_all[:w]
+                series = w_value_of(m, list(reversed(subset)))
+                val = w_summarize(w_value_of(m, subset))
+                out.setdefault(m, {}).setdefault("count", {})[int(w)] = {
+                    "value": float(val),
+                    "n": len(subset),
+                    "trend": float(round(w_ewma(series), 2)) if series else 0.0,
+                    "spark": w_sparkline(series[-8:]),
+                }
+            # day windows
+            now_ms = int(time.time() * 1000)
+            for d in days_list:
+                cutoff = now_ms - d * 24 * 3600 * 1000
+                subset = [r for r in rows_all if r["game_creation_ms"] >= cutoff]
+                series = w_value_of(m, list(reversed(subset)))
+                val = w_summarize(w_value_of(m, subset))
+                out.setdefault(m, {}).setdefault("days", {})[int(d)] = {
+                    "value": float(val),
+                    "n": len(subset),
+                    "trend": float(round(w_ewma(series), 2)) if series else 0.0,
+                    "spark": w_sparkline(series[-8:]),
+                }
 
     # Also include short value arrays for charts (last up to 8)
     import sqlite3
     with store.connect() as con:
         con.row_factory = sqlite3.Row
-        mets = con.execute(
-            "SELECT * FROM metrics WHERE puuid=? AND (? IS NULL OR queue_id=?) ORDER BY game_creation_ms DESC LIMIT 50",
-            (puuid, queue, queue),
-        ).fetchall()
+        q = "SELECT * FROM metrics WHERE puuid=?"
+        params: list[Any] = [puuid]
+        q_queue = (None if (use_dynamic and queue == -1) else (queue if use_dynamic else cfg_queue))
+        if q_queue is not None:
+            q += " AND queue_id=?"
+            params.append(q_queue)
+        if use_dynamic and role:
+            q += " AND role=?"
+            params.append(role)
+        if use_dynamic and champion is not None:
+            q += " AND champion_id=?"
+            params.append(champion)
+        if use_dynamic and patch:
+            q += " AND patch=?"
+            params.append(patch)
+        q += " ORDER BY game_creation_ms DESC LIMIT 50"
+        mets = con.execute(q, params).fetchall()
     metrics_list = cfg.get("metrics", {}).get("primary", [])
     def series(metric: str):
         vals = []
@@ -140,7 +222,9 @@ def metrics_rolling(
         weight_sum += w
     summary = {"improvement_index": round(score_sum / weight_sum, 2) if weight_sum else 0.0, "provisional": provisional}
 
-    return {"ok": True, "data": {"windows": out, "series": windows_payload, "summary": summary}}
+    # Units map included for client formatting
+    units = {m: HUMAN_META.get(m, {}).get("unit") for m in metrics_list}
+    return {"ok": True, "data": {"windows": out, "series": windows_payload, "summary": summary, "units": units}}
 
 
 @router.get("/targets")
@@ -185,8 +269,9 @@ def get_targets():
             target = max(target or 0, p75)
         if target is None:
             target = 0
-        by_metric[m] = {"target": target, "p50": p50, "p75": p75}
-    return {"ok": True, "data": {"provisional": not baseline_ok, "by_metric": by_metric, "weights": weights}}
+        meta = HUMAN_META.get(m, {"name": m, "unit": "count"})
+        by_metric[m] = {"name": meta["name"], "unit": meta["unit"], "target": target, "p50": p50, "p75": p75}
+    return {"ok": True, "data": {"provisional": not baseline_ok, "metrics": by_metric, "weights": weights}}
 
 
 @router.get("/metrics/improvement-index")

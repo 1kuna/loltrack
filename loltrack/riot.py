@@ -39,6 +39,26 @@ class RiotClient:
             resp.raise_for_status()
             return resp.json()
 
+    def verify_key(self) -> bool:
+        """Best-effort verification of API key via a low-cost status endpoint.
+
+        Returns True if the key appears valid (2xx), False on 401/403.
+        Raises on network errors other than auth/rate limits.
+        """
+        url = f"{_base(self.platform)}/lol/status/v4/platform-data"
+        try:
+            resp = requests.get(url, headers=self._headers(), timeout=10)
+            if resp.status_code in (401, 403):
+                return False
+            if resp.status_code == 429:
+                # Treat rate limit as valid key
+                return True
+            resp.raise_for_status()
+            return True
+        except requests.RequestException:
+            # Network or other error; bubble up to caller for mapping
+            raise
+
     # Account V1
     def resolve_account(self, game_name: str, tag_line: str) -> Dict[str, Any]:
         url = f"{_base(self.region)}/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
@@ -59,4 +79,3 @@ class RiotClient:
     def get_timeline(self, match_id: str) -> Dict[str, Any]:
         url = f"{_base(self.region)}/lol/match/v5/matches/{match_id}/timeline"
         return self._get(url)
-

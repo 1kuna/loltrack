@@ -12,7 +12,7 @@ const router = createBrowserRouter([
   { path: '/', element: <Dashboard/> },
   { path: '/live', element: <Live/> },
   { path: '/matches', element: <Matches/> },
-  { path: '/targets', element: <Targets/> },
+  { path: '/goals', element: <Targets/> },
   { path: '/settings', element: <Settings/> },
 ])
 
@@ -25,7 +25,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           <a href="/" className="block hover:text-accent">Dashboard</a>
           <a href="/live" className="block hover:text-accent">Live Game</a>
           <a href="/matches" className="block hover:text-accent">Matches</a>
-          <a href="/targets" className="block hover:text-accent">Targets</a>
+          <a href="/goals" className="block hover:text-accent">Goals</a>
           <a href="/settings" className="block hover:text-accent">Settings</a>
         </nav>
       </aside>
@@ -35,4 +35,3 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     </div>
   </React.StrictMode>
 )
-
