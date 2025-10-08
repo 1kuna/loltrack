@@ -17,7 +17,7 @@ type Overview = {
 type Series = { minutes: number[]; goldDiff: number[]; xpDiff: number[]; cs: number[] }
 type Events = { elite: any[]; buildings: any[]; kills: any[]; wards: any[]; items: any[] }
 type AdvResponse = { overview: Overview, series: Series, events: Events }
-type GisMatch = { domains: Record<string, number>, overall_inst: number, z: Record<string, number> }
+type GisMatch = { domains: Record<string, number>, overall_inst: number, z: Record<string, Record<string, number>>, debug?: Record<string, { inputs: number, metrics: string[], value: number }> }
 
 export default function MatchDrawer({ matchId, onClose }: { matchId: string, onClose: () => void }){
   const [data, setData] = useState<AdvResponse | null>(null)
@@ -36,9 +36,20 @@ export default function MatchDrawer({ matchId, onClose }: { matchId: string, onC
     api<AdvResponse>(`/match/${matchId}/advanced`).then((d)=>{ setData(d); setLoading(false) }).catch((e)=>{ setErr(e); setLoading(false) })
   }, [matchId])
   const [gis, setGis] = useState<GisMatch|null>(null)
+  const [gisLoading, setGisLoading] = useState(false)
+  const [gisErr, setGisErr] = useState<string|null>(null)
+  const [showDiag, setShowDiag] = useState(false)
   useEffect(()=>{
-    api<GisMatch>(`/gis/match/${matchId}`).then(setGis).catch(()=>{})
+    fetchGis(false)
   }, [matchId])
+  async function fetchGis(recompute: boolean){
+    setGisLoading(true)
+    setGisErr(null)
+    api<GisMatch>(`/gis/match/${matchId}${recompute ? '?recompute=1' : ''}`)
+      .then(setGis)
+      .catch((e)=>{ setGisErr(String(e?.message||e)) })
+      .finally(()=> setGisLoading(false))
+  }
   const kdaColor = useMemo(()=>{
     const kda = data?.overview.kda || 0
     if (kda >= 4) return 'text-emerald-300'
@@ -95,12 +106,30 @@ export default function MatchDrawer({ matchId, onClose }: { matchId: string, onC
               <section className="card p-4">
                 <div className="flex items-center justify-between mb-2">
                   <h3 className="font-semibold">Domain Contributions</h3>
+                  <div className="flex items-center gap-2">
+                    {gisErr && <span className="text-xs text-red-400">{gisErr}</span>}
+                    <button className="text-xs text-slate-400 hover:text-slate-200" onClick={()=>setShowDiag(v=>!v)}>{showDiag ? 'Hide Diagnostics' : 'Show Diagnostics'}</button>
+                    <button disabled={gisLoading} className="text-xs text-slate-400 hover:text-slate-200" onClick={()=>fetchGis(true)}>{gisLoading ? 'Refreshing…' : 'Refresh'}</button>
+                  </div>
                 </div>
                 <div className="space-y-2">
                   {Object.entries(gis.domains).map(([k,v])=> (
                     <DomainBar key={k} label={cap(k)} value={v} />
                   ))}
                 </div>
+                {showDiag && (
+                  <div className="mt-3 text-xs text-slate-400 space-y-1">
+                    {Object.keys(gis.domains).map((d)=>{
+                      const inputs = (gis.debug?.[d]?.inputs) ?? Object.keys(gis.z?.[d]||{}).length
+                      const mets = Object.entries(gis.z?.[d]||{}).map(([m,z]) => `${m}:${z.toFixed(2)}`).join(', ')
+                      return (
+                        <div key={d}>
+                          <span className="text-slate-300">{cap(d)}</span>: inputs {inputs} {mets? `· ${mets}`: '(no inputs)'}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
               </section>
             )}
             <section className="card p-4">
@@ -210,21 +239,27 @@ function TimelineMini({ series }: { series: Series }){
 }
 
 function DomainBar({ label, value }: { label: string, value: number }){
-  const pct = Math.max(0, Math.min(100, value))
-  const diff = value - 50
-  const color = diff>=0 ? 'bg-green-500/70' : 'bg-red-500/70'
-  const width = Math.round(Math.abs(diff))
+  const diff = (value ?? 50) - 50
+  const color = diff >= 0 ? 'bg-green-500/70' : 'bg-red-500/70'
+  const width = Math.max(0, Math.min(100, Math.abs(diff)))
   return (
     <div>
-      <div className="text-xs text-slate-400">{label} <span className={diff>=0?'text-green-300':'text-red-300'}>({diff>=0?'+':''}{Math.round(diff)})</span></div>
+      <div className="text-xs text-slate-400">{label} <span className={diff>=0?'text-green-300':'text-red-300'}>({formatSigned(diff, 1)})</span></div>
       <div className="h-2 bg-slate-800 rounded relative overflow-hidden">
         <div className="absolute left-1/2 top-0 bottom-0 w-px bg-slate-600" />
-        <div className={`${color} h-full`} style={{ width: `${width}%`, marginLeft: diff>=0 ? '50%' : `${50-width}%` }} />
+        <div className={`${color} h-full`} style={{ width: `${width}%`, marginLeft: diff>=0 ? '50%' : `calc(50% - ${width}%)` }} />
       </div>
     </div>
   )
 }
 function cap(s: string){ return s.slice(0,1).toUpperCase()+s.slice(1) }
+
+function formatSigned(n: number, decimals=0){
+  const sign = n >= 0 ? '+' : '−'
+  const abs = Math.abs(n)
+  const fixed = abs.toFixed(decimals)
+  return `${sign}${fixed}`
+}
 
 function topChips(o: Overview): string[] {
   const out: string[] = []

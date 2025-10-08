@@ -7,6 +7,10 @@ type GisSummary = {
   domains: Record<string, number>
   delta5: number
   confidence_band?: number
+  gis_visible?: boolean
+  calibration_stage?: number
+  achilles_eligible?: boolean
+  secondary_eligible?: boolean
   focus: { primary: string|null, secondary: string[], deficits: Record<string, number>, advice?: string|null }
 }
 
@@ -21,6 +25,10 @@ export default function GISSummary(){
     return () => { active = false }
   }, [seg.queue, seg.role])
   if (err) return <div className="card text-red-400 text-sm">{String(err?.message||err)}</div>
+  const secondaryList = (data?.secondary_eligible && data?.focus?.secondary?.length)
+    ? data.focus.secondary
+    : []
+  const calibrating = (data?.calibration_stage ?? Number.POSITIVE_INFINITY) < 2
   return (
     <div className="card p-4 flex items-center justify-between">
       <div className="flex items-center gap-6">
@@ -28,7 +36,7 @@ export default function GISSummary(){
           <div className="text-xs text-slate-400">Overall Improvement</div>
           <div className="text-3xl font-bold">
             {data?.gis_visible ? Math.round(data.overall) : '—'}
-            {(data && data.calibration_stage < 2) && <span className="ml-2 text-xs text-amber-400 align-middle">Calibrating</span>}
+            {calibrating && <span className="ml-2 text-xs text-amber-400 align-middle">Calibrating</span>}
           </div>
           <div className="text-xs text-slate-400">Δ last 5: <span className={twDelta(data?.delta5)}>{fmtDelta(data?.delta5)}</span></div>
           <div className="text-xs text-slate-500">Confidence: {bandLabel(data?.confidence_band)}</div>
@@ -45,10 +53,10 @@ export default function GISSummary(){
           {(data?.achilles_eligible && data?.focus?.advice) && <div className="text-xs text-slate-400 mt-1">{data.focus.advice}</div>}
           <div className="text-xs text-slate-400 mt-1">Also slipping:</div>
           <div className="flex gap-2 flex-wrap mt-1">
-            {((data?.secondary_eligible && data?.focus?.secondary)||[]).map((d, i)=> (
+            {secondaryList.map((d, i) => (
               <span key={i} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-200">{cap(d)}</span>
             ))}
-            {(!data?.secondary_eligible || !data?.focus?.secondary || data.focus.secondary.length===0) && (<span className="text-[10px] text-slate-500">None</span>)}
+            {secondaryList.length === 0 && (<span className="text-[10px] text-slate-500">None</span>)}
           </div>
         </div>
       </div>

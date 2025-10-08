@@ -1,6 +1,6 @@
 export function fmtCount(n: number|null|undefined): string {
   if (n === null || n === undefined || Number.isNaN(n)) return '—'
-  return Math.round(n).toString()
+  return Math.round(n).toLocaleString()
 }
 
 export function fmtDiff(n: number|null|undefined): string {
@@ -15,7 +15,9 @@ export function fmtGold(n: number|null|undefined): string { return fmtDiff(n) }
 
 export function fmtRate(frac: number|null|undefined): string {
   if (frac === null || frac === undefined || Number.isNaN(frac)) return '—'
-  return `${(frac * 100).toFixed(1)}%`
+  const pct = frac <= 1 ? frac * 100 : frac
+  const decimals = pct < 10 ? 1 : 0
+  return `${pct.toFixed(decimals)}%`
 }
 
 export function fmtTime(seconds: number|null|undefined): string {
@@ -31,6 +33,7 @@ export function formatByUnit(unit: string, value: number|null|undefined): string
     case 'count': return fmtCount(value)
     case 'gold': return fmtGold(value)
     case 'xp': return fmtXP(value)
+    case 'percent':
     case 'rate': return fmtRate(value ?? 0)
     case 'time': return fmtTime(value)
     default: return fmtCount(value)

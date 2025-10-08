@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 
-from ..deps import config as get_cfg
+from ..deps import config as get_cfg, save_config as save_cfg
 from core.store import Store
 
 
@@ -232,20 +232,61 @@ def get_targets():
     cfg = get_cfg()
     weights = cfg.get("metrics", {}).get("weights", {})
     manual_targets = cfg.get("metrics", {}).get("targets", {})
-    # Compute provisional/baseline when possible
+    goals_cfg = cfg.get("goals", {})
+    conservative_floor = goals_cfg.get("conservative_floor", {"CS10": 55, "GD10": -200})
+    step_min = goals_cfg.get("step_min", {"CS10": 3, "GD10": 50})
+    ratchet_inc = goals_cfg.get("ratchet_inc", {"CS10": 3, "GD10": 50})
+
     puuid = cfg.get("player", {}).get("puuid")
     store = Store()
+    # Determine context: configured tracked queue and resolved role from recent matches
+    q_in = (cfg.get("player", {}).get("track_queues") or [None])[0]
+    q = None if q_in == -1 else q_in
+    ranked = set(int(x) for x in (cfg.get("gis", {}).get("rankedQueues") or [420, 440]))
+    # Resolve dominant role from recent ranked matches in this queue (if any)
+    resolved_role = None
+    try:
+        import sqlite3
+        with store.connect() as con:
+            con.row_factory = sqlite3.Row
+            inner = "SELECT role FROM matches WHERE puuid=? AND queue_id IN (%s)" % (",".join([str(x) for x in ranked]))
+            params = [puuid]
+            if q is not None:
+                inner += " AND queue_id=?"
+                params.append(q)
+            inner += " ORDER BY game_creation_ms DESC LIMIT 20"
+            sql = f"SELECT role, COUNT(1) as n FROM ({inner}) t GROUP BY role ORDER BY n DESC LIMIT 1"
+            row = con.execute(sql, params).fetchone()
+            if row and row["role"]:
+                resolved_role = row["role"]
+    except Exception:
+        pass
+
+    # Load all metric rows in context (ranked + queue + role)
     import sqlite3, statistics as stats
     with store.connect() as con:
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT * FROM metrics WHERE puuid=? ORDER BY game_creation_ms ASC LIMIT 10",
-            (puuid,),
-        ).fetchall()
+        qbase = "SELECT * FROM metrics WHERE puuid=?"
+        params: list[Any] = [puuid]
+        if q is not None:
+            qbase += " AND queue_id=?"
+            params.append(q)
+        # role filter if resolved
+        if resolved_role:
+            qbase += " AND role=?"
+            params.append(resolved_role)
+        # ranked-only
+        if ranked:
+            qbase += " AND queue_id IN (%s)" % (",".join([str(x) for x in ranked]))
+        qbase += " ORDER BY game_creation_ms DESC"
+        rows_all = con.execute(qbase, params).fetchall()
+
+    sample_n = len(rows_all)
     metrics_list = cfg.get("metrics", {}).get("primary", [])
-    def vals(metric: str):
+
+    def vals(metric: str, rs):
         arr = []
-        for r in rows:
+        for r in rs:
             if metric == "DL14": arr.append(float(r["dl14"]))
             elif metric == "CS10": arr.append(float(r["cs10"]))
             elif metric == "CS14": arr.append(float(r["cs14"]))
@@ -255,29 +296,229 @@ def get_targets():
             elif metric == "KPEarly": arr.append(float(r["kp_early"]))
             elif metric == "FirstRecall": arr.append(float(r["first_recall_s"]))
         return arr
-    baseline_ok = len(rows) >= 10
-    by_metric = {}
+
+    # Load ratchet state
+    import json
+    key_state = f"goals:ratchet:{puuid}"
+    try:
+        raw = store.get_meta(key_state)
+        state = json.loads(raw) if raw else {"targets": {}}
+    except Exception:
+        state = {"targets": {}}
+    last_targets: Dict[str, float] = dict(state.get("targets") or {})
+    # Sanitize legacy mis-scaled targets: ensure DL14 (rate) is stored as a fraction 0..1
+    try:
+        if "DL14" in last_targets:
+            v = float(last_targets.get("DL14") or 0.0)
+            if v > 1.5:  # clearly percent-like, fix to fraction
+                last_targets["DL14"] = round(v / 100.0, 4)
+    except Exception:
+        pass
+
+    by_metric: Dict[str, Dict[str, Any]] = {}
+
     for m in metrics_list:
-        v = vals(m)
-        p50 = stats.median(v) if v else None
+        series_all = vals(m, rows_all)
+        # personal baseline = median of last up to 20 samples
+        if series_all:
+            baseline = stats.median(series_all[:20])
+        else:
+            baseline = 0.0
+        # cohort p70 not available yet; leave as None
+        cohort_p70 = None
+        # Defaults
+        manual = (manual_targets.get(m, {}) or {}).get("manual_floor")
+        # Manual overrides are stored canonically: for rate metrics as fractions 0..1.
+        # Convert to internal unit for computation: DL14 already 0..1; KPEarly etc. use 0..100 in storage.
+        unit = (HUMAN_META.get(m, {}) or {}).get("unit", "count")
+        if manual is not None and unit == "rate" and m != "DL14":
+            try:
+                manual = float(manual) * 100.0
+            except Exception:
+                manual = manual
+        base_floor = float(conservative_floor.get(m, 0) or 0)
+        step = float(step_min.get(m, 0) or 0)
+        inc = float(ratchet_inc.get(m, step) or step)
+        # Build default target by sample size
+        if manual is not None:
+            default_target = float(manual)
+        else:
+            if sample_n < 8:
+                default_target = max(base_floor, baseline + step)
+            else:
+                if cohort_p70 is not None:
+                    default_target = round(0.5 * baseline + 0.5 * float(cohort_p70))
+                else:
+                    default_target = baseline + step
+        # Ratchet using last 5 matches against last target (or default)
+        last_target = float(last_targets.get(m, default_target))
+        # If manual override present and higher (or lower for time), respect and reset base
+        unit = (HUMAN_META.get(m, {}) or {}).get("unit", "count")
+        last5 = series_all[:5]
+        achieved = 0
+        # For time metrics, lower is better
+        if unit == "time":
+            # If manual provided and lower than last_target, keep the lower manual without lowering ratchet automatically
+            if manual is not None:
+                try:
+                    manual_f = float(manual)
+                    last_target = min(last_target, manual_f)
+                except Exception:
+                    pass
+            for v in last5:
+                try:
+                    if v <= last_target:
+                        achieved += 1
+                except Exception:
+                    pass
+            if achieved >= 3:
+                # Lower target slightly (faster recall) by inc
+                last_target = max(0.0, last_target - inc)
+        else:
+            # If manual provided and higher than last_target, raise baseline to manual immediately (no auto-lower)
+            if manual is not None:
+                try:
+                    manual_f = float(manual)
+                    if manual_f > last_target:
+                        last_target = manual_f
+                except Exception:
+                    pass
+            # For rates (0..100), values are stored as 0..100 except DL14 which is 0..1
+            for v in last5:
+                try:
+                    if m == "DL14":
+                        vv = float(v)  # already 0..1
+                        tt = float(last_target)
+                    else:
+                        vv = float(v)
+                        tt = float(last_target)
+                    if vv >= tt:
+                        achieved += 1
+                except Exception:
+                    pass
+            if achieved >= 3:
+                last_target = last_target + inc
+        # Persist back (do not auto-lower targets)
+        if m not in last_targets or last_targets.get(m) != last_target:
+            # Persist in canonical units: DL14 as 0..1 fraction; other rates (e.g., KPEarly) use their series units (0..100)
+            if unit == "rate" and m == "DL14":
+                last_targets[m] = float(last_target)
+            else:
+                last_targets[m] = float(last_target)
+
+        # Compute p50/p75 for context (based on all rows)
+        p50 = (stats.median(series_all) if series_all else None)
         p75 = None
-        if v:
-            s = sorted(v)
-            p75 = s[int(0.75 * (len(s)-1))]
-        target = manual_targets.get(m, {}).get("manual_floor") if manual_targets.get(m, {}) else None
-        if baseline_ok and p75 is not None:
-            target = max(target or 0, p75)
-        if target is None:
-            target = 0
+        if series_all:
+            srt = sorted(series_all)
+            p75 = srt[int(0.75 * (len(srt) - 1))]
+
         meta = HUMAN_META.get(m, {"name": m, "unit": "count"})
+        t_out: Optional[float] = last_target
         # Normalize rates to fractions 0..1 for UI formatting where needed.
-        # DL14 is already 0..1 in storage; KPEarly is stored as 0..100.
+        # DL14 already 0..1; others like KPEarly use 0..100 in metrics storage.
         if meta["unit"] == "rate" and m != "DL14":
             p50 = (p50 / 100.0) if (p50 is not None) else None
             p75 = (p75 / 100.0) if (p75 is not None) else None
-            target = (target / 100.0) if (target is not None) else None
-        by_metric[m] = {"name": meta["name"], "unit": meta["unit"], "target": target, "p50": p50, "p75": p75}
-    return {"ok": True, "data": {"provisional": not baseline_ok, "metrics": by_metric, "weights": weights}}
+            t_out = (t_out / 100.0) if (t_out is not None) else None
+        # Progress ratio toward target (0..1), using last-5 average where available
+        prog: Optional[float] = None
+        try:
+            last5_vals = series_all[:5]
+            v = (sum(last5_vals) / len(last5_vals)) if last5_vals else None
+            if v is not None and t_out is not None and t_out != 0:
+                if meta["unit"] == "time":
+                    prog = max(0.0, min(1.0, (t_out or 0.0) / (v or 1.0)))
+                elif meta["unit"] == "rate":
+                    # Ensure v is as fraction (convert if KPEarly-style 0..100)
+                    vv = (v / 100.0) if (m != "DL14") else v
+                    prog = max(0.0, min(1.0, vv / (t_out or 1.0)))
+                else:
+                    prog = max(0.0, min(1.0, (v or 0.0) / (t_out or 1.0)))
+        except Exception:
+            prog = None
+        by_metric[m] = {"name": meta["name"], "unit": meta["unit"], "target": t_out, "p50": p50, "p75": p75, "progress_ratio": prog}
+
+    # Save ratchet state
+    try:
+        store.set_meta(key_state, json.dumps({"targets": last_targets}))
+    except Exception:
+        pass
+
+    # Provisional if limited sample so far
+    provisional = sample_n < 8
+    return {"ok": True, "data": {"provisional": provisional, "metrics": by_metric, "weights": weights}}
+
+
+@router.delete("/targets/overrides")
+def reset_overrides():
+    cfg = get_cfg()
+    # Clear any manual targets/overrides
+    try:
+        if isinstance(cfg.get("metrics"), dict):
+            cfg["metrics"]["targets"] = {}
+        else:
+            cfg.setdefault("metrics", {})["targets"] = {}
+        save_cfg(cfg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"code": "WRITE_FAILED", "message": str(e)})
+    return {"ok": True, "data": True}
+
+
+@router.post("/targets/override")
+def set_target_override(payload: Dict[str, Any]):
+    """Force-set a manual target override for a metric.
+
+    Payload: { metric: string, value: number|string }
+    For rate metrics, accepts 65, "65%", or 0.65 and stores 0.65.
+    """
+    metric = (payload or {}).get("metric")
+    raw_val = (payload or {}).get("value")
+    if not metric or raw_val is None:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "metric and value are required"})
+    meta = HUMAN_META.get(metric, {"unit": "count"})
+
+    def _parse_rate(v: Any) -> float:
+        if isinstance(v, str):
+            s = v.strip()
+            if s.endswith("%"):
+                s = s[:-1]
+            try:
+                n = float(s)
+            except Exception:
+                raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "Enter a number like 65 or 0.65"})
+        else:
+            try:
+                n = float(v)
+            except Exception:
+                raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "Enter a number like 65 or 0.65"})
+        frac = n / 100.0 if n > 1.0 else n
+        if frac < 0 or frac > 1:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "Rate must be 0–100% (e.g., 65 or 0.65)"})
+        return float(frac)
+
+    # Canonicalize by unit
+    if meta.get("unit") == "rate":
+        # Store fraction 0..1 for all rate metrics including DL14
+        v_canon = _parse_rate(raw_val)
+        # For internal ratchet logic using 0..100 (except DL14), we adjust during computation
+    else:
+        try:
+            v_canon = float(raw_val)
+        except Exception:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "value must be a number"})
+
+    cfg = get_cfg()
+    cfg.setdefault("metrics", {}).setdefault("targets", {})
+    prev = (cfg["metrics"]["targets"].get(metric) or {})
+    prev["manual_floor"] = v_canon
+    cfg["metrics"]["targets"][metric] = prev
+    try:
+        save_cfg(cfg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"code": "WRITE_FAILED", "message": str(e)})
+    # Return current /targets shape for convenience
+    return get_targets()
 
 
 @router.get("/metrics/improvement-index")

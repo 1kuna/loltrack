@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -563,3 +564,107 @@ class Store:
             q += " ORDER BY game_creation_ms ASC"  # chronological for stable EWMA
             rows = con.execute(q, params).fetchall()
         return list(rows)
+
+    # ---- Helpers for compute-on-open ----
+    def has_inst_contrib(self, match_id: str, puuid: str) -> bool:
+        return self.seen_inst_for_match(match_id, puuid)
+
+    def get_inst_contrib(self, match_id: str, puuid: str) -> Optional[Dict[str, Any]]:
+        """Return payload for inst_contrib if present; otherwise None.
+
+        Payload shape: { domains, overall_inst, z }
+        """
+        with self.connect() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                "SELECT domain, inst_score, z_metrics FROM inst_contrib WHERE match_id=? AND puuid=?",
+                (match_id, puuid),
+            ).fetchall()
+            m = con.execute("SELECT role FROM matches WHERE match_id=?", (match_id,)).fetchone()
+        if not rows:
+            return None
+        # Build domains map
+        domains: Dict[str, float] = {}
+        for r in rows:
+            try:
+                domains[str(r["domain"])]= float(r["inst_score"]) if r["inst_score"] is not None else 50.0
+            except Exception:
+                pass
+        # Ensure all domains are present (fill with 50.0 if missing) for stable UI rendering
+        from . import gis as _gis
+        for d in _gis.DOMAINS:
+            domains.setdefault(d, 50.0)
+        # Compute overall using current role weights (file-backed, Balanced fallback)
+        role = (m["role"] if m and m["role"] else None)
+        from . import gis as _gis  # lazy to avoid cycles
+        try:
+            RW = _gis.load_role_weights()
+            W = RW.get((role or "").upper()) or RW.get("BALANCED") or _gis.ROLE_DOMAIN_WEIGHTS.get("UTILITY")
+        except Exception:
+            W = _gis.ROLE_DOMAIN_WEIGHTS.get("UTILITY")
+        total = sum(W.values()) or 1.0
+        overall_inst = 50.0
+        for d, wk in W.items():
+            if d in domains:
+                overall_inst += (wk / total) * (domains[d] - 50.0)
+        # Rebuild zipped z maps per domain
+        z_by_domain: Dict[str, Any] = {}
+        for r in rows:
+            try:
+                zd = json.loads(r["z_metrics"]) if r["z_metrics"] else {}
+                z_by_domain[str(r["domain"])]= {k: float(v) for k, v in (zd or {}).items()}
+            except Exception:
+                pass
+        for d in _gis.DOMAINS:
+            z_by_domain.setdefault(d, {})
+        return {"domains": {k: float(v) for k, v in domains.items()}, "overall_inst": float(overall_inst), "z": z_by_domain}
+
+    def upsert_inst_contrib_bulk(self, match_id: str, puuid: str, domains: Dict[str, float], z: Dict[str, Dict[str, float]]) -> None:
+        """Bulk upsert inst_contrib rows in one transaction.
+
+        - domains: map domain -> inst score (0..100)
+        - z: map domain -> {metric: z}
+        """
+        with self.connect() as con:
+            cur = con.cursor()
+            for d, score in (domains or {}).items():
+                z_map = (z or {}).get(d) or {}
+                try:
+                    z_json = __import__('json').dumps(z_map)
+                except Exception:
+                    z_json = "{}"
+                cur.execute(
+                    """
+                    INSERT INTO inst_contrib(match_id, puuid, domain, inst_score, z_metrics)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(match_id, puuid, domain) DO UPDATE SET
+                        inst_score=excluded.inst_score,
+                        z_metrics=excluded.z_metrics
+                    """,
+                    (match_id, puuid, str(d), float(score), z_json),
+                )
+            con.commit()
+
+    def read_inst_contrib_payload(self, match_id: str, puuid: str) -> Dict[str, Any]:
+        payload = self.get_inst_contrib(match_id, puuid)
+        return payload or {"domains": {}, "overall_inst": 50.0, "z": {}}
+
+    def load_match(self, match_id: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as con:
+            row = con.execute("SELECT raw_json FROM matches WHERE match_id=?", (match_id,)).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return __import__('json').loads(row[0])
+        except Exception:
+            return None
+
+    def load_timeline(self, match_id: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as con:
+            row = con.execute("SELECT raw_json FROM timelines WHERE match_id=?", (match_id,)).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return __import__('json').loads(row[0])
+        except Exception:
+            return None

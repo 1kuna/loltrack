@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import threading, time
 
 from .store import Store
 from .metrics import MS, find_frame_at, lane_opponent_id, participant_by_puuid
@@ -196,7 +197,9 @@ def _extract_features(store: Store, match_id: str, puuid: str) -> Tuple[Dict[str
 
     # Compute extras (from cache or on-the-fly); store cache if missing
     # Attempt to fetch cached row for speed
+    import sqlite3 as _sqlite3
     with store.connect() as con:
+        con.row_factory = _sqlite3.Row
         ex = con.execute("SELECT * FROM metrics_extras WHERE match_id=?", (match_id,)).fetchone()
         mx = con.execute("SELECT * FROM metrics WHERE match_id=?", (match_id,)).fetchone()
     if ex is None:
@@ -333,12 +336,15 @@ DOMAIN_METRIC_WEIGHTS: Dict[str, Dict[str, float]] = {
 }
 
 # Role domain weights: default presets
+# Role domain weights: default presets + balanced fallback
 _DEFAULT_ROLE_WEIGHTS: Dict[str, Dict[str, float]] = {
     "TOP": {"laning": .30, "economy": .20, "damage": .15, "macro": .15, "objectives": .10, "vision": .05, "discipline": .05},
     "JUNGLE": {"objectives": .30, "macro": .20, "laning": .10, "economy": .10, "damage": .10, "vision": .10, "discipline": .10},
     "MIDDLE": {"laning": .28, "damage": .20, "economy": .18, "macro": .14, "objectives": .10, "vision": .05, "discipline": .05},
     "BOTTOM": {"economy": .25, "damage": .22, "laning": .22, "objectives": .12, "macro": .09, "vision": .05, "discipline": .05},
     "UTILITY": {"vision": .28, "objectives": .20, "macro": .14, "laning": .14, "damage": .12, "economy": .06, "discipline": .06},
+    # Balanced: equal weights across domains
+    "BALANCED": {d: (1.0 / len(DOMAINS)) for d in DOMAINS},
 }
 
 import os, json as _json
@@ -400,33 +406,59 @@ def _standardize(store: Store, puuid: str, queue: Optional[int], role: Optional[
     out: Dict[str, float] = {}
     states: Dict[str, Tuple[float, float]] = {}
     alpha = _alpha_from_hl(HL_METRIC)
+    # Global epsilon sigma floor to avoid z=0 collapse during early calibration
+    try:
+        EPS_SIGMA = float((get_config().get("gis", {}) or {}).get("epsSigma", 0.5))
+    except Exception:
+        EPS_SIGMA = 0.5
+    # Sensitivity floors for early calibration (smaller = more sensitive)
     eps_map = {
-        "gd10": 50.0, "gd15": 60.0, "xpd10": 50.0, "xpd15": 60.0,
-        "csd10": 1.0, "csd14": 1.0, "csmin14": 0.2,
-        "dpm": 50.0, "gpm": 20.0, "damage_share": 2.0,
-        "obj_participation": 5.0, "obj_near": 0.5,
-        "vision_per_min": 0.1, "wards_killed": 0.2, "ctrl_wards_pre14": 0.2,
-        "early_deaths_pre10": 0.2, "time_dead_per_min": 1.0,
-        "mythic_at_s": 30.0, "two_item_at_s": 30.0, "kp_early": 5.0,
-        "dmg_obj": 50.0, "dmg_turrets": 50.0,
+        "gd10": 20.0, "gd15": 25.0, "xpd10": 20.0, "xpd15": 25.0,
+        "csd10": 0.5, "csd14": 0.5, "csmin14": 0.1,
+        "dpm": 20.0, "gpm": 10.0, "damage_share": 1.0,
+        "obj_participation": 2.0, "obj_near": 0.3,
+        "vision_per_min": 0.05, "wards_killed": 0.1, "ctrl_wards_pre14": 0.1,
+        "early_deaths_pre10": 0.1, "time_dead_per_min": 0.5,
+        "mythic_at_s": 15.0, "two_item_at_s": 15.0, "kp_early": 3.0,
+        "dmg_obj": 20.0, "dmg_turrets": 20.0,
     }
+    def _load_norm_with_fallback(metric: str) -> Tuple[Optional[float], Optional[float]]:
+        # Try exact (queue, role), then relax role, then relax queue, then both
+        combos = [
+            (queue, role),
+            (None, role),
+            (queue, None),
+            (None, None),
+        ]
+        for q, r in combos:
+            mu, var = store.load_norm(puuid, q, r, metric)
+            if mu is not None and var is not None:
+                return mu, var
+        return None, None
+
     for m, x in metrics.items():
         mu, var = store.load_norm(puuid, queue, role, m)
+        if mu is None or var is None:
+            # try fallback states
+            fmu, fvar = _load_norm_with_fallback(m)
+            if fmu is not None and fvar is not None:
+                mu, var = fmu, fvar
+        seeded = False
         if mu is None or var is None:
             # Seed with current value and a small variance to avoid div-by-zero; we will warm over first few matches
             mu = float(x)
             var = float(eps_map.get(m, 1.0)) ** 2
-        # Update EWMA mean/var with current x
-        # EWMA mean
+            seeded = True
+        # Compute z against PRE-update state to avoid collapsing to zero for first/early matches
+        std_prev = (var ** 0.5) if var > 1e-6 else float(eps_map.get(m, 1.0))
+        sigma_prev = max(std_prev, EPS_SIGMA)
+        z_prev = (float(x) - mu) / max(sigma_prev, 1e-6)
+        out[m] = _huber_clip_z(z_prev, huber_k)
+        # Update EWMA mean/var with current x (after z computed)
         mu_new = mu + alpha * (float(x) - mu)
-        # EWMA variance (exponentially weighted). Using classical form: var_t = (1-alpha)*(var_{t-1} + alpha*(x - mu_{t-1})^2)
         var_new = (1.0 - alpha) * (var + alpha * (float(x) - mu) ** 2)
-        # Save state back
         store.upsert_norm(puuid, queue, role, m, mu_new, var_new)
         states[m] = (mu_new, var_new)
-        std = (var_new ** 0.5) if var_new > 1e-6 else float(eps_map.get(m, 1.0))
-        z = (float(x) - mu_new) / max(std, 1e-6)
-        out[m] = _huber_clip_z(z, huber_k)
     return out, states
 
 
@@ -460,7 +492,12 @@ def _domain_inst_scores(role: Optional[str], z: Dict[str, float]) -> Tuple[Dict[
 def _overall_inst(role: Optional[str], domain_inst: Dict[str, float]) -> float:
     role_key = (role or "").upper()
     # Load effective weights (file-backed)
-    W = load_role_weights().get(role_key) or load_role_weights().get("UTILITY") or _DEFAULT_ROLE_WEIGHTS.get("UTILITY")
+    W = (
+        load_role_weights().get(role_key)
+        or load_role_weights().get("BALANCED")
+        or _DEFAULT_ROLE_WEIGHTS.get("BALANCED")
+        or _DEFAULT_ROLE_WEIGHTS.get("UTILITY")
+    )
     # Ensure weights sum to 1
     total = sum(W.values()) or 1.0
     out = 50.0
@@ -583,7 +620,9 @@ def achilles_and_secondary(store: Store, puuid: str, queue: Optional[int], role:
 
     Uses last N matches' inst_contrib for this (player, queue, role).
     """
+    import sqlite3
     with store.connect() as con:
+        con.row_factory = sqlite3.Row
         base = (
             "SELECT i.match_id, i.domain, i.inst_score "
             "FROM inst_contrib i JOIN matches m ON m.match_id = i.match_id "
@@ -642,3 +681,363 @@ def achilles_and_secondary(store: Store, puuid: str, queue: Optional[int], role:
             primary = cand
     secondary = [d for d, v in ordered[1:3] if v <= -2.0]
     return {"primary": primary, "secondary": secondary, "deficits": {d: round(v, 2) for d, v in ordered}}
+
+
+# ---- On-demand per-match computation (no ranked gating) ----
+_IC_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def role_of(match: Dict[str, Any], puuid: str) -> Optional[str]:
+    try:
+        parts = (match.get("info") or {}).get("participants") or []
+        me = next((p for p in parts if p.get("puuid") == puuid), None) or {}
+        return me.get("teamPosition") or None
+    except Exception:
+        return None
+
+
+def compute_z_for_match(match: Dict[str, Any], timeline: Dict[str, Any], puuid: str) -> Dict[str, float]:
+    """Compute z-scores for metrics of a single match vs player's baselines.
+
+    Internally persists updated EWMA state; deterministic for given inputs and baseline state.
+    """
+    # Temporarily persist raw to leverage existing feature extraction helpers
+    st = Store()
+    # Try to get matchId from payload; if absent, caller should already have persisted or extracted features
+    mid = (match.get("metadata") or {}).get("matchId") or None
+    if mid:
+        try:
+            # Ensure rows exist so _extract_features can read/cache extras
+            info = match.get("info", {})
+            me = next((p for p in (info.get("participants") or []) if p.get("puuid") == puuid), {})
+            st.upsert_match_raw(
+                match_id=str(mid),
+                puuid=puuid,
+                queue_id=int(info.get("queueId") or 0),
+                game_creation_ms=int(info.get("gameCreation") or 0),
+                game_duration_s=int(info.get("gameDuration") or 0),
+                patch=str(info.get("gameVersion", "")).split(" ")[0],
+                role=me.get("teamPosition") or None,
+                champion_id=int(me.get("championId") or 0),
+                raw_json=json.dumps(match),
+            )
+            st.upsert_timeline_raw(str(mid), json.dumps(timeline or {}))
+        except Exception:
+            pass
+        vals, meta = _extract_features(st, str(mid), puuid)
+        # Patch-easing huber threshold per queue/role/patch
+        huber_k = 2.5
+        try:
+            current_patch = str((match.get("info") or {}).get("gameVersion", "")).split(" ")[0]
+            queue_id = int((match.get("info") or {}).get("queueId") or 0)
+            key = f"patch_ease:{puuid}:{queue_id}:{(meta.get('role') or '')}"
+            raw = st.get_meta(key)
+            state = json.loads(raw) if raw else None
+            if (state or {}).get("patch") != current_patch:
+                state = {"patch": current_patch, "remain": 3}
+            if (state or {}).get("remain", 0) > 0:
+                huber_k = 3.0
+                state["remain"] = int(state.get("remain", 0)) - 1
+            st.set_meta(key, json.dumps(state))
+        except Exception:
+            pass
+        qid = int(meta.get("queue_id") or ((match.get("info") or {}).get("queueId") or 0))
+        role = meta.get("role") or role_of(match, puuid)
+        z, _ = _standardize(st, puuid, qid, role, vals, huber_k=huber_k)
+        return z
+    # Fallback: extract minimal features directly if matchId missing
+    vals, meta = _extract_features(st, "", puuid)
+    z, _ = _standardize(st, puuid, meta.get("queue_id"), meta.get("role"), vals)
+    return z
+
+
+def compute_domain_inst(z: Dict[str, float], role: Optional[str]) -> Dict[str, float]:
+    inst_domains, _ = _domain_inst_scores(role, z)
+    # Champion mastery guardrail cannot be applied here without match context; leave as-is
+    return inst_domains
+
+
+def compute_overall_inst(domains: Dict[str, float], role: Optional[str]) -> float:
+    return _overall_inst(role, domains)
+
+
+def ensure_inst_contrib(match_id: str, puuid: str, force: bool = False) -> Dict[str, Any]:
+    """Compute and persist inst_contrib rows for (match_id, puuid) if missing.
+
+    - Loads match and timeline from DB; if missing, fetches via Riot API and persists.
+    - Computes z-scores vs personal baselines (queue, role aware); NO ranked gating.
+    - Persists one row per domain with zipped z-metrics for that domain.
+    - Returns payload: { domains, overall_inst, z, computed: True }.
+    """
+    store = Store()
+    # Quick path (unless force)
+    if not force and store.has_inst_contrib(match_id, puuid):
+        payload = store.read_inst_contrib_payload(match_id, puuid)
+        payload["computed"] = False
+        return payload
+
+    # Concurrency: small lock per (match_id, puuid)
+    key = f"{match_id}:{puuid}"
+    lock = _IC_LOCKS.setdefault(key, threading.Lock())
+    acquired = lock.acquire(blocking=False)
+    if not acquired:
+        # Another compute in-flight; wait briefly for it to finish and read
+        t_deadline = time.time() + 5.0
+        while time.time() < t_deadline:
+            time.sleep(0.05)
+            if not force and store.has_inst_contrib(match_id, puuid):
+                payload = store.read_inst_contrib_payload(match_id, puuid)
+                payload["computed"] = False
+                return payload
+        # Timed out waiting; proceed without holding lock
+    else:
+        # Ensure we release the lock
+        try:
+            pass
+        finally:
+            # We'll release after compute below
+            pass
+
+    # Load match + timeline (from DB; fetch if missing)
+    match = store.load_match(match_id)
+    timeline = store.load_timeline(match_id)
+    if not match:
+        # Fetch via Riot API
+        cfg = get_config()
+        rc = RiotClient.from_config(cfg, kind="fg")
+        m = rc.get_match(match_id)
+        if not m or not (m.get("metadata") or {}).get("matchId"):
+            # Normalize error for router
+            if acquired:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+            raise RuntimeError("match not found or invalid matchId")
+        # Persist and continue
+        info = m.get("info", {})
+        me = next((p for p in (info.get("participants") or []) if p.get("puuid") == puuid), {})
+        store.upsert_match_raw(
+            match_id=str((m.get("metadata") or {}).get("matchId")),
+            puuid=puuid,
+            queue_id=int(info.get("queueId") or 0),
+            game_creation_ms=int(info.get("gameCreation") or 0),
+            game_duration_s=int(info.get("gameDuration") or 0),
+            patch=str(info.get("gameVersion", "")).split(" ")[0],
+            role=me.get("teamPosition") or None,
+            champion_id=int(me.get("championId") or 0),
+            raw_json=json.dumps(m),
+        )
+        match = m
+    if not timeline:
+        cfg = get_config()
+        rc = RiotClient.from_config(cfg, kind="fg")
+        tl = rc.get_timeline(match_id)
+        store.upsert_timeline_raw(match_id, json.dumps(tl))
+        timeline = tl
+
+    # Compute features and z-scores (queue/role aware)
+    # Use internal extractor to also populate extras cache if missing
+    vals, meta = _extract_features(store, match_id, puuid)
+    role = meta.get("role") or role_of(match, puuid)
+    queue_id = int(meta.get("queue_id") or (match.get("info", {}).get("queueId") or 0))
+
+    # Patch-change easing for Huber threshold
+    huber_k = 2.5
+    try:
+        current_patch = str((match.get("info") or {}).get("gameVersion", "")).split(" ")[0]
+        key_pe = f"patch_ease:{puuid}:{queue_id}:{role or ''}"
+        raw = store.get_meta(key_pe)
+        state = json.loads(raw) if raw else None
+        if (state or {}).get("patch") != current_patch:
+            state = {"patch": current_patch, "remain": 3}
+        if (state or {}).get("remain", 0) > 0:
+            huber_k = 3.0
+            state["remain"] = int(state.get("remain", 0)) - 1
+        store.set_meta(key_pe, json.dumps(state))
+    except Exception:
+        pass
+
+    z, _ = _standardize(store, puuid, queue_id, role, vals, huber_k=huber_k)
+
+    # If everything sits at exactly baseline (50) despite inputs being present,
+    # derive z from historical matches prior to this match time to avoid first-sample collapse.
+    try:
+        m_info = (match.get("info") or {})
+        ms = int(m_info.get("gameCreation") or 0)
+        # Detect flat output (all ~0 z or all domain inst ~ 50)
+        flat = all(abs(z.get(k, 0.0)) < 1e-9 for k in z.keys())
+        if flat and ms:
+            # Build z from history
+            import sqlite3 as _sqlite3
+            with store.connect() as con:
+                con.row_factory = _sqlite3.Row
+                q = (
+                    "SELECT m.game_creation_ms, mx.gd10, mx.xpd10, mx.csmin14, mx.ctrl_wards_pre14, mx.kp_early, "
+                    "       ex.dpm, ex.gpm, ex.obj_participation, ex.mythic_at_s, ex.two_item_at_s, ex.vision_per_min, ex.wards_killed, ex.roam_distance_pre14 "
+                    "FROM matches m "
+                    "LEFT JOIN metrics mx ON mx.match_id = m.match_id "
+                    "LEFT JOIN metrics_extras ex ON ex.match_id = m.match_id "
+                    "WHERE m.puuid=? AND m.game_creation_ms<? AND (? IS NULL OR m.queue_id=?) AND (? IS NULL OR m.role=?) "
+                    "ORDER BY m.game_creation_ms DESC LIMIT 50"
+                )
+                rows = con.execute(q, (puuid, ms, queue_id, queue_id, role, role)).fetchall()
+            if rows:
+                import statistics as _stats
+                def series_of(metric: str) -> list[float]:
+                    arr = []
+                    for r in rows:
+                        v = None
+                        if metric == "gd10": v = r["gd10"]
+                        elif metric == "xpd10": v = r["xpd10"]
+                        elif metric == "csmin14": v = r["csmin14"]
+                        elif metric == "ctrl_wards_pre14": v = r["ctrl_wards_pre14"]
+                        elif metric == "kp_early": v = r["kp_early"]
+                        elif metric == "dpm": v = r["dpm"]
+                        elif metric == "gpm": v = r["gpm"]
+                        elif metric == "obj_participation": v = r["obj_participation"]
+                        elif metric == "mythic_at_s": v = r["mythic_at_s"]
+                        elif metric == "two_item_at_s": v = r["two_item_at_s"]
+                        elif metric == "vision_per_min": v = r["vision_per_min"]
+                        elif metric == "wards_killed": v = r["wards_killed"]
+                        elif metric == "roam_distance_pre14": v = r["roam_distance_pre14"]
+                        if v is None:
+                            continue
+                        try:
+                            arr.append(float(v))
+                        except Exception:
+                            continue
+                    return arr
+                def robust_std(arr: list[float], floor: float) -> float:
+                    if not arr:
+                        return floor
+                    med = _stats.median(arr)
+                    mad = _stats.median([abs(x - med) for x in arr]) if arr else 0.0
+                    rs = 1.4826 * mad
+                    return max(rs, floor)
+                eps_map = {
+                    "gd10": 50.0, "xpd10": 50.0, "csmin14": 0.2,
+                    "dpm": 50.0, "gpm": 20.0,
+                    "obj_participation": 5.0, "vision_per_min": 0.1, "wards_killed": 0.2, "ctrl_wards_pre14": 0.2,
+                    "mythic_at_s": 30.0, "two_item_at_s": 30.0, "kp_early": 5.0, "roam_distance_pre14": 50.0,
+                }
+                z_hist: Dict[str, float] = {}
+                for mkey, xval in vals.items():
+                    if mkey not in eps_map:
+                        continue
+                    arr = series_of(mkey)
+                    if not arr:
+                        continue
+                    med = _stats.median(arr)
+                    sigma = robust_std(arr, eps_map[mkey])
+                    try:
+                        z_hist[mkey] = (float(xval) - float(med)) / max(sigma, 1e-6)
+                    except Exception:
+                        pass
+                if z_hist:
+                    z = z_hist
+            else:
+                # Fallback: no prior rows before this match; use up to 50 other matches (any time) as baseline
+                import sqlite3 as _sqlite3
+                with store.connect() as con:
+                    con.row_factory = _sqlite3.Row
+                    q = (
+                        "SELECT m.game_creation_ms, mx.gd10, mx.xpd10, mx.csmin14, mx.ctrl_wards_pre14, mx.kp_early, "
+                        "       ex.dpm, ex.gpm, ex.obj_participation, ex.mythic_at_s, ex.two_item_at_s, ex.vision_per_min, ex.wards_killed, ex.roam_distance_pre14 "
+                        "FROM matches m "
+                        "LEFT JOIN metrics mx ON mx.match_id = m.match_id "
+                        "LEFT JOIN metrics_extras ex ON ex.match_id = m.match_id "
+                        "WHERE m.puuid=? AND m.match_id<>? AND (? IS NULL OR m.queue_id=?) AND (? IS NULL OR m.role=?) "
+                        "ORDER BY m.game_creation_ms DESC LIMIT 50"
+                    )
+                    rows_any = con.execute(q, (puuid, match_id, queue_id, queue_id, role, role)).fetchall()
+                if rows_any:
+                    import statistics as _stats
+                    def series_of_any(metric: str) -> list[float]:
+                        arr = []
+                        for r in rows_any:
+                            v = None
+                            if metric == "gd10": v = r["gd10"]
+                            elif metric == "xpd10": v = r["xpd10"]
+                            elif metric == "csmin14": v = r["csmin14"]
+                            elif metric == "ctrl_wards_pre14": v = r["ctrl_wards_pre14"]
+                            elif metric == "kp_early": v = r["kp_early"]
+                            elif metric == "dpm": v = r["dpm"]
+                            elif metric == "gpm": v = r["gpm"]
+                            elif metric == "obj_participation": v = r["obj_participation"]
+                            elif metric == "mythic_at_s": v = r["mythic_at_s"]
+                            elif metric == "two_item_at_s": v = r["two_item_at_s"]
+                            elif metric == "vision_per_min": v = r["vision_per_min"]
+                            elif metric == "wards_killed": v = r["wards_killed"]
+                            elif metric == "roam_distance_pre14": v = r["roam_distance_pre14"]
+                            if v is None:
+                                continue
+                            try:
+                                arr.append(float(v))
+                            except Exception:
+                                continue
+                        return arr
+                    def robust_std_any(arr: list[float], floor: float) -> float:
+                        if not arr:
+                            return floor
+                        med = _stats.median(arr)
+                        mad = _stats.median([abs(x - med) for x in arr]) if arr else 0.0
+                        rs = 1.4826 * mad
+                        return max(rs, floor)
+                    eps_map = {
+                        "gd10": 50.0, "xpd10": 50.0, "csmin14": 0.2,
+                        "dpm": 50.0, "gpm": 20.0,
+                        "obj_participation": 5.0, "vision_per_min": 0.1, "wards_killed": 0.2, "ctrl_wards_pre14": 0.2,
+                        "mythic_at_s": 30.0, "two_item_at_s": 30.0, "kp_early": 5.0, "roam_distance_pre14": 50.0,
+                    }
+                    z_hist: Dict[str, float] = {}
+                    for mkey, xval in vals.items():
+                        if mkey not in eps_map:
+                            continue
+                        arr = series_of_any(mkey)
+                        if not arr:
+                            continue
+                        med = _stats.median(arr)
+                        sigma = robust_std_any(arr, eps_map[mkey])
+                        try:
+                            z_hist[mkey] = (float(xval) - float(med)) / max(sigma, 1e-6)
+                        except Exception:
+                            pass
+                    if z_hist:
+                        z = z_hist
+    except Exception:
+        pass
+
+    # Domain inst (0..100) - raw, no gating/clamps for this on-demand endpoint
+    inst_domains, _per_metric = _domain_inst_scores(role, z)
+
+    # Build per-domain z maps for persistence (only metrics used by that domain)
+    z_by_domain: Dict[str, Dict[str, float]] = {}
+    for d, metrics in DOMAIN_METRIC_WEIGHTS.items():
+        z_by_domain[d] = {}
+        for mname in metrics.keys():
+            if mname in z:
+                try:
+                    z_by_domain[d][mname] = float(z[mname])
+                except Exception:
+                    pass
+
+    # Persist rows
+    store.upsert_inst_contrib_bulk(match_id, puuid, inst_domains, z_by_domain)
+
+    # Compute overall inst (role-weighted; no gating)
+    overall_inst = _overall_inst(role, inst_domains)
+
+    # Release lock if held
+    if acquired:
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+    return {
+        "domains": {k: float(v) for k, v in inst_domains.items()},
+        "overall_inst": float(overall_inst),
+        "z": z_by_domain,
+        "computed": True,
+    }

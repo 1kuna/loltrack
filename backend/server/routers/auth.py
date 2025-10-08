@@ -62,6 +62,31 @@ def get_cfg():
 @config_router.put("/config")
 def put_cfg(payload: Dict[str, Any]):
     cfg = get_config()
+    # Validate metric target overrides: rate metrics must be fractions 0..1
+    try:
+        incoming_targets = ((payload.get("metrics") or {}).get("targets") or {})
+        # HUMAN_META duplicated here would be messy; import lazily
+        from .metrics import HUMAN_META as _HUMAN_META  # type: ignore
+        for m, ent in (incoming_targets or {}).items():
+            if not isinstance(ent, dict):
+                continue
+            unit = (_HUMAN_META.get(m, {}) or {}).get("unit")
+            if unit == "rate":
+                val = ent.get("manual_floor")
+                if val is None:
+                    continue
+                try:
+                    f = float(val)
+                except Exception:
+                    raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": f"{m} must be 0–100% (e.g., 65 or 0.65)"})
+                # Accept canonical fraction only; frontend normalizes already
+                if f < 0 or f > 1:
+                    raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": f"{m} must be 0–100% (e.g., 65 or 0.65)"})
+    except HTTPException:
+        raise
+    except Exception:
+        # Do not block other config updates if validation probing fails
+        pass
     # shallow merge
     for k, v in payload.items():
         if isinstance(v, dict) and isinstance(cfg.get(k), dict):

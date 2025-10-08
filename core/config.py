@@ -73,6 +73,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "secondaryGap": -2.0,
         "rankedQueues": [420, 440],
         "maxNegativeImpactLowMastery": 3.0,
+        # Floor for standardization sigma to avoid z=0 collapse early on
+        "epsSigma": 0.5,
+    },
+    # Goals configuration (targets + ratchet)
+    "goals": {
+        "conservative_floor": {
+            "CS10": 55,
+            "GD10": -200
+        },
+        "step_min": {
+            "CS10": 3,
+            "GD10": 50
+        },
+        "ratchet_inc": {
+            "CS10": 3,
+            "GD10": 50
+        }
     },
 }
 

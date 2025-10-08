@@ -17,6 +17,7 @@ export default function Settings() {
     return () => clearInterval(id)
   }, [])
   const [saving, setSaving] = useState(false)
+  const [busy, setBusy] = useState(false)
   const saveKey = async () => {
     setSaving(true); setErr('')
     try { const r = await post('/auth/riot-key', {key: riotKey}); setMsg('Key verified'); setKeyVerified(true) }
@@ -54,6 +55,26 @@ export default function Settings() {
           try { await post('/sync/bootstrap', {}); setMsg('Sync started') }
           catch(e:any){ setErr(mapErrorMessage(e)) }
         }}>Sync last 14 days</button>
+      </div>
+
+      <div className="card space-y-2">
+        <div className="font-semibold">Maintenance</div>
+        <div className="text-xs text-slate-400">Recalculate domain contributions, smoothed scores, and rolling windows for all matches.</div>
+        <button
+          className={`px-3 py-1 rounded ${busy? 'bg-slate-600 text-slate-300' : 'bg-slate-700 text-slate-100 hover:bg-slate-600'}`}
+          disabled={busy}
+          onClick={async()=>{
+            setBusy(true); setErr('')
+            try {
+              const r: any = await post('/gis/rebuild-all?clear=1', {})
+              const bf = r?.backfilled ?? 0
+              const sm = r?.smoothed ?? 0
+              setMsg(`Rebuilt: backfilled ${bf}, smoothed ${sm}`) 
+            } catch(e:any){
+              setErr(mapErrorMessage(e))
+            } finally { setBusy(false); setTimeout(()=>setMsg(''), 2500) }
+          }}
+        >{busy ? 'Recalculating…' : 'Recalculate Everything'}</button>
       </div>
     </div>
   )

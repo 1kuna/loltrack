@@ -9,6 +9,8 @@ import logging, time
 from ..deps import config as get_cfg
 from core.store import Store
 from core.gis import ROLE_DOMAIN_WEIGHTS, DOMAINS, achilles_and_secondary, load_role_weights
+from core import gis as _gis
+from core.windows import rebuild_windows as _rebuild_windows
 
 
 router = APIRouter()
@@ -53,6 +55,7 @@ def gis_summary(queue: Optional[int] = Query(None), role: Optional[str] = Query(
     domains = {d: (store.load_domain_score(puuid, q_for_overall, role, d) or 50.0) for d in DOMAINS}
     # Delta vs last 5 matches: compute inst overall average of last 5 minus previous 5
     with store.connect() as con:
+        con.row_factory = __import__('sqlite3').Row
         rows = con.execute(
             """
             SELECT i.match_id, i.domain, i.inst_score, i.z_metrics, m.game_creation_ms
@@ -74,8 +77,13 @@ def gis_summary(queue: Optional[int] = Query(None), role: Optional[str] = Query(
             pass
     ordered = sorted(by_match.values(), key=lambda x: x["ms"], reverse=True)
     def inst_overall(dom_map: Dict[str, float]) -> float:
-        role_key = (resolved_role or "").upper() or "UTILITY"
-        W = ROLE_DOMAIN_WEIGHTS.get(role_key) or ROLE_DOMAIN_WEIGHTS.get("UTILITY")
+        role_key = (resolved_role or "").upper()
+        # Prefer file-backed weights with Balanced fallback
+        try:
+            W_all = load_role_weights()
+            W = W_all.get(role_key) or W_all.get("BALANCED") or ROLE_DOMAIN_WEIGHTS.get("UTILITY")
+        except Exception:
+            W = ROLE_DOMAIN_WEIGHTS.get("UTILITY")
         total = sum(W.values()) or 1.0
         s = 50.0
         for d, wk in W.items():
@@ -246,9 +254,6 @@ def get_weights():
 
 @router.put("/gis/weights")
 def put_weights(payload: Dict[str, Any]):
-    if not _is_admin():
-        from fastapi import HTTPException
-        raise HTTPException(status_code=403, detail="admin only")
     roles = (payload or {}).get("roles")
     if not isinstance(roles, dict) or not roles:
         return {"ok": False, "error": {"code": "INVALID", "message": "roles map required"}}
@@ -282,6 +287,108 @@ def put_weights(payload: Dict[str, Any]):
         return get_weights()
     except Exception as e:
         return {"ok": False, "error": {"code": "WRITE_FAILED", "message": str(e)}}
+
+
+@router.post("/gis/backfill")
+def backfill_inst(limit: int = 200, queue: Optional[int] = Query(None)):
+    """Backfill per-match domain contributions for recent matches in chronological order.
+
+    Runs the same pipeline used after ingest (with smoothing/clamps), but also persists per-match inst_contrib
+    so drawers open fast. Useful when contributions are missing for older matches.
+    """
+    cfg = get_cfg()
+    puuid = cfg.get("player", {}).get("puuid")
+    if not puuid:
+        return {"ok": False, "error": {"code": "MISSING_PREREQ", "message": "Add your Riot ID in Settings."}}
+    from core.gis import process_new_matches as _process
+    store = Store()
+    # process all matches for the player (optionally queue-filtered). list_matches_for_player returns ASC (oldest first)
+    count = 0
+    try:
+        rows = store.list_matches_for_player(puuid, queue)
+        rows = rows[-int(limit):] if limit and limit > 0 else rows
+        for r in rows:
+            mid = r["match_id"]
+            # Skip if we already have inst rows
+            if store.seen_inst_for_match(mid, puuid):
+                continue
+            # Use the same function that persists inst_contrib and smoothed scores
+            try:
+                from core.gis import update_scores_for_match as _update
+                res = _update(store, puuid, mid)
+                if res is not None:
+                    count += 1
+            except Exception:
+                # Non-blocking: continue on errors
+                pass
+        return {"ok": True, "data": {"backfilled": count}}
+    except Exception as e:
+        return {"ok": False, "error": {"code": "BACKFILL_ERR", "message": str(e)}}
+
+
+@router.post("/gis/rebuild-all")
+def rebuild_all(clear: bool = Query(True), queue: Optional[int] = Query(None)):
+    """Recalculate contributions and smoothed scores for all matches, then rebuild rolling windows.
+
+    - If clear=True, clears previous inst_contrib, score_domain, score_overall, norm_state for this player first.
+    - Processes matches chronologically to warm baselines.
+    - Rebuilds windows for current queue setting.
+    """
+    cfg = get_cfg()
+    puuid = cfg.get("player", {}).get("puuid")
+    if not puuid:
+        return {"ok": False, "error": {"code": "MISSING_PREREQ", "message": "Add your Riot ID in Settings."}}
+    store = Store()
+    cleared = {"inst": 0, "domain": 0, "overall": 0, "norm": 0, "windows": 0}
+    if clear:
+        try:
+            with store.connect() as con:
+                c1 = con.execute("DELETE FROM inst_contrib WHERE puuid=?", (puuid,)).rowcount or 0
+                c2 = con.execute("DELETE FROM score_domain WHERE player_id=?", (puuid,)).rowcount or 0
+                c3 = con.execute("DELETE FROM score_overall WHERE player_id=?", (puuid,)).rowcount or 0
+                c4 = con.execute("DELETE FROM norm_state WHERE player_id=?", (puuid,)).rowcount or 0
+                c5 = con.execute("DELETE FROM windows WHERE key LIKE ?", (f"puuid:{puuid}:%",)).rowcount or 0
+                con.commit()
+                cleared = {"inst": c1, "domain": c2, "overall": c3, "norm": c4, "windows": c5}
+        except Exception:
+            pass
+    # Process matches
+    backfilled = 0
+    smoothed = 0
+    rows = store.list_matches_for_player(puuid, queue)
+    for r in rows:
+        mid = r["match_id"]
+        try:
+            # First, ensure per-match inst contributions (no gating/clamps)
+            try:
+                payload = _gis.ensure_inst_contrib(mid, puuid, force=True)
+                if payload and bool(payload.get("computed", False)):
+                    backfilled += 1
+            except Exception:
+                pass
+            # Then, update smoothed scores (ranked gating included)
+            res = _gis.update_scores_for_match(store, puuid, mid)
+            if res is not None:
+                smoothed += 1
+        except Exception:
+            # continue through failures
+            pass
+    # Second pass: recompute again now that baselines warmed (stabilize earliest matches)
+    try:
+        for r in rows:
+            mid = r["match_id"]
+            try:
+                _gis.ensure_inst_contrib(mid, puuid, force=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Rebuild windows
+    try:
+        _rebuild_windows(store, cfg)
+    except Exception:
+        pass
+    return {"ok": True, "data": {"backfilled": backfilled, "smoothed": smoothed, "cleared": cleared}}
 
 def suggestion_for(domain: str, metric: str):
     m = metric
@@ -317,36 +424,109 @@ def suggestion_for(domain: str, metric: str):
 
 
 @router.get("/gis/match/{match_id}")
-def gis_match(match_id: str):
+def gis_match(match_id: str, recompute: Optional[bool] = Query(False), debug: Optional[bool] = Query(False)):
+    """Compute-on-open for per-match domain contributions.
+
+    Behavior: return existing inst_contrib if present; otherwise compute now from
+    stored match + timeline (or fetch), persist, and return in one response.
+    No ranked-only filtering here.
+    """
+    t0 = time.time()
+    logger = logging.getLogger(__name__)
     cfg = get_cfg()
     puuid = cfg.get("player", {}).get("puuid")
     if not puuid:
         return {"ok": False, "error": {"code": "MISSING_PREREQ", "message": "Add your Riot ID in Settings."}}
     store = Store()
-    with store.connect() as con:
-        rows = con.execute(
-            "SELECT domain, inst_score, z_metrics FROM inst_contrib WHERE match_id=? AND puuid=?",
-            (match_id, puuid),
-        ).fetchall()
-        m = con.execute("SELECT role FROM matches WHERE match_id=?", (match_id,)).fetchone()
-    if not rows:
-        return {"ok": True, "data": {"domains": {}, "overall_inst": 50.0, "z": {}}}
-    domains = {r["domain"]: float(r["inst_score"]) for r in rows}
-    # Compute inst overall for this match
-    role = (m[0] if m else None) or "UTILITY"
-    role_key = (role or "").upper()
-    W = ROLE_DOMAIN_WEIGHTS.get(role_key) or ROLE_DOMAIN_WEIGHTS.get("UTILITY")
-    total = sum(W.values()) or 1.0
-    overall_inst = 50.0
-    for d, wk in W.items():
-        if d in domains:
-            overall_inst += (wk / total) * (domains[d] - 50.0)
-    # Flatten z metrics across domains for debug
-    zmap: Dict[str, float] = {}
-    for r in rows:
+    # Try cache first (unless recompute requested)
+    if not recompute:
+        cached = store.get_inst_contrib(match_id, puuid)
+        if cached:
+            ms = (time.time() - t0) * 1000.0
+            # Sanity log: include roleResolved, domainsInstJSON, zMetricsCount
+            try:
+                store = Store()
+                with store.connect() as con:
+                    row = con.execute("SELECT role FROM matches WHERE match_id=?", (match_id,)).fetchone()
+                role_resolved = (row[0] if row and row[0] else None)
+            except Exception:
+                role_resolved = None
+            z_count = 0
+            try:
+                z_count = sum(len(v or {}) for v in (cached.get("z") or {}).values())
+            except Exception:
+                z_count = 0
+            logger.info(
+                "/gis/match computed_on_open",
+                extra={
+                    "matchId": match_id,
+                    "puuid": puuid,
+                    "roleResolved": role_resolved,
+                    "domainsInstJSON": json.dumps(cached.get("domains") or {}),
+                    "zMetricsCount": int(z_count),
+                    "computed": False,
+                    "ms": round(ms, 1),
+                },
+            )
+            # Ensure computed flag in payload for acceptance checks
+            cached["computed"] = False
+            return {"ok": True, "data": cached}
+    # Compute if missing
+    try:
+        payload = _gis.ensure_inst_contrib(match_id, puuid, force=bool(recompute))
+        ms = (time.time() - t0) * 1000.0
+        # Sanity log: include resolved role, domains and z-count
         try:
-            z = json.loads(r["z_metrics"]) if r["z_metrics"] else {}
-            zmap.update({f"{r['domain']}.{k}": float(v) for k, v in z.items()})
+            store = Store()
+            with store.connect() as con:
+                row = con.execute("SELECT role FROM matches WHERE match_id=?", (match_id,)).fetchone()
+            role_resolved = (row[0] if row and row[0] else None)
+        except Exception:
+            role_resolved = None
+        z_count = 0
+        try:
+            z_count = sum(len(v or {}) for v in (payload.get("z") or {}).values())
+        except Exception:
+            z_count = 0
+        # Extra debug: attach domains debug summary to response and log clearly to console
+        try:
+            zmap = payload.get("z") or {}
+            dbg = {d: {"inputs": len((zmap.get(d) or {})), "metrics": list((zmap.get(d) or {}).keys()), "value": float(payload.get("domains", {}).get(d, 0.0))} for d in (payload.get("domains") or {}).keys()}
+            payload["debug"] = dbg
+            # Always emit a concise, copy/paste-friendly line via uvicorn.access
+            try:
+                # Log via uvicorn.error to avoid AccessFormatter tuple expectations
+                elog = logging.getLogger("uvicorn.error")
+                parts = []
+                for d in sorted(dbg.keys()):
+                    ent = dbg[d]
+                    parts.append(f"{d}: inputs={ent['inputs']} value={ent['value']:.2f} metrics={','.join(ent['metrics']) if ent['metrics'] else '-'}")
+                elog.info("/gis/match debug matchId=%s %s", match_id, " | ".join(parts))
+            except Exception:
+                pass
+            if debug:
+                logger.info("/gis/match debug", extra={"matchId": match_id, "domains": dbg})
         except Exception:
             pass
-    return {"ok": True, "data": {"domains": {k: round(v, 2) for k, v in domains.items()}, "overall_inst": round(overall_inst, 2), "z": zmap}}
+        logger.info(
+            "/gis/match computed_on_open",
+            extra={
+                "matchId": match_id,
+                "puuid": puuid,
+                "roleResolved": role_resolved,
+                "domainsInstJSON": json.dumps(payload.get("domains") or {}),
+                "zMetricsCount": int(z_count),
+                "computed": True,
+                "ms": round(ms, 1),
+            },
+        )
+        return {"ok": True, "data": payload}
+    except Exception as e:
+        # Map common errors: not found vs other
+        from fastapi import HTTPException
+        msg = str(e)
+        if "not found" in msg.lower() or "404" in msg or "invalid" in msg.lower():
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "matchId not found; pass metadata.matchId (like NA1_123...)."})
+        # Unknown failure
+        logger.exception("/gis/match error for %s", match_id)
+        raise HTTPException(status_code=500, detail={"code": "compute_failed", "message": "Failed to compute contributions."})
