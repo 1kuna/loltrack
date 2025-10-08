@@ -66,7 +66,7 @@ def champ_id_to_name(ver: str, champ_id: int) -> Optional[str]:
     p = d / "champion.json"
     if not p.exists():
         ensure_ddragon()
-    data = json.loads(p.read_text())
+    data = json.loads(p.read_text(encoding="utf-8"))
     # map via 'key' -> 'id'
     for name, obj in data.get("data", {}).items():
         try:
@@ -83,7 +83,7 @@ def load_items_json(ver: str) -> Dict[str, Any]:
     if not p.exists():
         ensure_ddragon()
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {"data": {}}
 
@@ -94,7 +94,7 @@ def load_runes_json(ver: str) -> Dict[str, Any]:
     if not p.exists():
         ensure_ddragon()
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -153,7 +153,7 @@ def spell_id_to_name(ver: str, spell_id: int) -> Optional[str]:
     p = d / "summoner.json"
     if not p.exists():
         ensure_ddragon()
-    data = json.loads(p.read_text())
+    data = json.loads(p.read_text(encoding="utf-8"))
     for name, obj in data.get("data", {}).items():
         try:
             if int(obj.get("key")) == spell_id:

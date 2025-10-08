@@ -373,7 +373,7 @@ def load_role_weights() -> Dict[str, Dict[str, float]]:
         p = _Path(path)
         if not p.exists():
             return _DEFAULT_ROLE_WEIGHTS
-        data = _json.loads(p.read_text())
+        data = _json.loads(p.read_text(encoding="utf-8"))
         roles = data.get("roles") if isinstance(data, dict) else data
         if not isinstance(roles, dict):
             return _DEFAULT_ROLE_WEIGHTS
